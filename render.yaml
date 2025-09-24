@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: tienda-render
+    name: VirtualStoreBEnd
     runtime: python
     plan: free
     buildCommand: "pip install -r requirements.txt"
