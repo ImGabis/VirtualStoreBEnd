@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: tienda-render
+    runtime: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "gunicorn app:app"
