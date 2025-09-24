@@ -1,114 +1,212 @@
+from flask import Flask, request, jsonify, send_file
+from flask_cors import CORS
+import sqlite3
+import matplotlib.pyplot as plt
+import io
 
-import os, time, sqlite3, random
-from datetime import datetime, timedelta
-from threading import Event as ThreadEvent
-from flask import Flask, request, jsonify, Response, send_from_directory
+app = Flask(__name__)
+CORS(app)
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DIST_DIR = os.path.join(BASE_DIR, "dist")
-DB_PATH  = os.path.join(BASE_DIR, "tienda.db")
-
-app = Flask(__name__, static_folder=DIST_DIR, static_url_path="/")
-ventas_event = ThreadEvent()
-
-def get_conn():
-    conn = sqlite3.connect(DB_PATH, timeout=15, check_same_thread=False)
+def get_db():
+    conn = sqlite3.connect('compras.db')
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON;")
     return conn
 
-with get_conn() as conn:
-    conn.execute("PRAGMA journal_mode = WAL;")
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS productos (id INTEGER PRIMARY KEY AUTOINCREMENT, titulo TEXT NOT NULL, precio REAL NOT NULL);
-        CREATE TABLE IF NOT EXISTS pedidos (id INTEGER PRIMARY KEY AUTOINCREMENT, nombre TEXT NOT NULL, correo TEXT NOT NULL, creado_en TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS pedido_items (id INTEGER PRIMARY KEY AUTOINCREMENT, pedido_id INTEGER NOT NULL, producto_id INTEGER NOT NULL, cantidad INTEGER NOT NULL, precio_unitario REAL NOT NULL,
-            FOREIGN KEY (pedido_id) REFERENCES pedidos(id) ON DELETE CASCADE,
-            FOREIGN KEY (producto_id) REFERENCES productos(id));
-    """)
+@app.route('/compras', methods=['GET'])
+def listar_compras():
+    db = get_db()
+    compras = db.execute('SELECT * FROM compras ORDER BY fecha DESC').fetchall()
+    db.close()
+    return jsonify([dict(row) for row in compras])
 
-@app.get("/api/health")
-def health(): return {"ok": True}
+@app.route('/compras', methods=['POST'])
+def crear_compra():
+    data = request.json
+    db = get_db()
+    db.execute(
+        'INSERT INTO compras (nombre, apellidos, cedula, direccion, correo, carrito, totalPagado, fecha) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        (
+            data['nombre'],
+            data['apellidos'],
+            data['cedula'],
+            data['direccion'],
+            data['correo'],
+            str(data['carrito']),
+            data['totalPagado'],
+            data['fecha']
+        )
+    )
+    db.commit()
+    db.close()
+    return jsonify({'status': 'ok'}), 201
 
-@app.get("/api/productos")
-def productos_listar():
-    with get_conn() as conn:
-        rows = conn.execute("SELECT id, titulo, precio FROM productos ORDER BY id").fetchall()
-        return jsonify([dict(r) for r in rows])
+@app.route('/compras', methods=['DELETE'])
+def borrar_compras():
+    db = get_db()
+    db.execute('DELETE FROM compras')
+    db.commit()
+    db.close()
+    return jsonify({'status': 'ok'})
+    
+@app.route('/grafica-ventas-articulos', methods=['GET'])
+def grafica_ventas_articulos():
+    import json
+    metrica = request.args.get('metrica', 'cantidad')
+    sin_fecha = request.args.get('sin_fecha', '0') == '1'
+    conn = sqlite3.connect('compras.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT carrito, fecha FROM compras")
+    rows = cursor.fetchall()
+    conn.close()
 
-@app.post("/api/pedidos")
-def pedidos_crear():
-    data = request.get_json(force=True) or {}
-    nombre = str(data.get("nombre") or "").strip()
-    correo = str(data.get("correo") or "").strip()
-    items = data.get("items") or []
-    if not nombre or not correo or not isinstance(items, list) or len(items)==0:
-        return jsonify({"error":"Datos incompletos"}), 400
-    with get_conn() as conn:
-        cur = conn.cursor()
-        ts = datetime.now().isoformat(timespec="seconds")
-        cur.execute("INSERT INTO pedidos(nombre, correo, creado_en) VALUES(?,?,?)", (nombre, correo, ts))
-        pedido_id = cur.lastrowid
-        for it in items:
-            pid = it.get("id"); titulo = str(it.get("titulo") or "").strip(); qty = int(it.get("qty") or 1)
-            try: precio_unit = float(it.get("precio"))
-            except Exception: precio_unit = 0.0
-            prod_row = None
-            if pid is not None:
-                prod_row = cur.execute("SELECT id, precio FROM productos WHERE id=?", (int(pid),)).fetchone()
-            if prod_row is None and titulo:
-                prod_row = cur.execute("SELECT id, precio FROM productos WHERE lower(trim(titulo))=lower(trim(?))", (titulo,)).fetchone()
-            if prod_row is None:
-                cur.execute("INSERT INTO productos(titulo, precio) VALUES(?,?)", (titulo, precio_unit))
-                producto_id = cur.lastrowid
-            else:
-                producto_id = prod_row["id"]
-                if not precio_unit: precio_unit = float(prod_row["precio"])
-            cur.execute("INSERT INTO pedido_items(pedido_id, producto_id, cantidad, precio_unitario) VALUES(?,?,?,?)", (pedido_id, producto_id, qty, precio_unit))
-        conn.commit(); ventas_event.set()
-    return jsonify({"ok": True, "pedido_id": pedido_id})
+    if sin_fecha:
+        # Agrupar totales por artículo desde el carrito
+        totales = {}
+        for carrito_str, fecha in rows:
+            try:
+                carrito = json.loads(carrito_str.replace("'", '"'))
+            except Exception:
+                carrito = []
+            for item in carrito:
+                nombre = item.get('nombre', 'Desconocido')
+                cantidad = int(item.get('cantidad', 1))
+                ingreso = float(item.get('precio', 0)) * cantidad
+                if nombre not in totales:
+                    totales[nombre] = {'cantidad': 0, 'ingreso': 0}
+                totales[nombre]['cantidad'] += cantidad
+                totales[nombre]['ingreso'] += ingreso
 
-@app.get("/api/ventas-top")
-def ventas_top():
-    with get_conn() as conn:
-        rows = conn.execute("""
-            SELECT prod.titulo AS titulo, SUM(pi.cantidad) AS cantidad, SUM(pi.cantidad*pi.precio_unitario) AS ingreso
-            FROM pedidos ped JOIN pedido_items pi ON pi.pedido_id=ped.id JOIN productos prod ON prod.id=pi.producto_id
-            WHERE ped.creado_en >= DATETIME('now', '-30 days') GROUP BY prod.titulo
-            ORDER BY SUM(pi.cantidad) DESC LIMIT 6
-        """).fetchall()
-    return jsonify([dict(r) for r in rows])
+        nombres = list(totales.keys())
+        valores = [totales[n][metrica] for n in nombres]
 
-@app.post("/api/seed")
-def seed():
-    titles = ["Leggings Pro", "Top Compresión", "Jogger Fit", "Short Runner", "Camiseta Dry"]; precios = [120000,90000,135000,80000,70000]
-    hoy = datetime.now()
-    with get_conn() as conn:
-        cur = conn.cursor()
-        for t,p in zip(titles,precios): cur.execute("INSERT INTO productos(titulo, precio) VALUES(?,?)",(t,p))
-        for i in range(12):
-            fecha = (hoy - timedelta(days=random.randint(0,14))).replace(hour=12,minute=0,second=0)
-            cur.execute("INSERT INTO pedidos(nombre, correo, creado_en) VALUES(?,?,?)",(f"Cliente {i+1}", f"c{i+1}@mail.com", fecha.isoformat(timespec="seconds")))
-            pedido_id = cur.lastrowid
-            for _ in range(random.randint(1,3)):
-                prod = cur.execute("SELECT id, precio FROM productos ORDER BY RANDOM() LIMIT 1").fetchone()
-                qty = random.randint(1,4)
-                cur.execute("INSERT INTO pedido_items(pedido_id, producto_id, cantidad, precio_unitario) VALUES(?,?,?,?)", (pedido_id, prod["id"], qty, prod["precio"]))
-        conn.commit()
-    try: ventas_event.set()
-    except: pass
-    return {"ok": True, "msg": "Sembrado con éxito"}
+        import numpy as np
+        plt.figure(figsize=(12, 6))
+        plt.bar(nombres, valores, color='#1a237e')
+        plt.xlabel('Artículo')
+        plt.ylabel('Cantidad' if metrica == 'cantidad' else 'Ingreso')
+        plt.title('Ventas totales por artículo')
+        plt.xticks(rotation=45)
+        # Eje Y: enteros de 1 a 10
+        plt.yticks(np.arange(1, 11, 1))
+        plt.ylim(1, 10)
+        plt.tight_layout()
+    else:
+        # Agrupar por artículo y fecha desde el carrito
+        datos = {}
+        fechas_set = set()
+        for carrito_str, fecha in rows:
+            try:
+                carrito = json.loads(carrito_str.replace("'", '"'))
+            except Exception:
+                carrito = []
+            for item in carrito:
+                nombre = item.get('nombre', 'Desconocido')
+                cantidad = int(item.get('cantidad', 1))
+                ingreso = float(item.get('precio', 0)) * cantidad
+                if nombre not in datos:
+                    datos[nombre] = {}
+                if fecha not in datos[nombre]:
+                    datos[nombre][fecha] = {'cantidad': 0, 'ingreso': 0}
+                datos[nombre][fecha]['cantidad'] += cantidad
+                datos[nombre][fecha]['ingreso'] += ingreso
+                fechas_set.add(fecha)
 
-@app.get("/assets/<path:path>")
-def serve_assets(path): return send_from_directory(os.path.join(DIST_DIR, "assets"), path)
+        fechas = sorted(fechas_set)
 
-@app.get("/", defaults={"path": ""})
-@app.get("/<path:path>")
-def spa(path):
-    full = os.path.join(DIST_DIR, path)
-    if path and os.path.exists(full): return send_from_directory(DIST_DIR, path)
-    return send_from_directory(DIST_DIR, "index.html")
+        import numpy as np
+        plt.figure(figsize=(12, 6))
+        for nombre, serie in datos.items():
+            valores = [serie.get(fecha, {}).get(metrica, 0) for fecha in fechas]
+            plt.plot(fechas, valores, label=nombre)
+
+        plt.xlabel('Fecha')
+        plt.ylabel('Cantidad' if metrica == 'cantidad' else 'Ingreso')
+        plt.title('Evolución de ventas por artículo')
+        plt.legend()
+        plt.xticks(rotation=45)
+        # Eje Y: enteros de 1 a 10
+        plt.yticks(np.arange(1, 11, 1))
+        plt.ylim(1, 10)
+        plt.tight_layout()
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png')
+    plt.close()
+    buf.seek(0)
+    return send_file(buf, mimetype='image/png')
+
+if __name__ == '__main__':
+    # Inicializar la base de datos si no existe
+    conn = sqlite3.connect('compras.db')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS compras (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            nombre TEXT,
+            apellidos TEXT,
+            cedula TEXT,
+            direccion TEXT,
+            correo TEXT,
+            carrito TEXT,
+            totalPagado INTEGER,
+            fecha TEXT
+        )
+    ''')
+    conn.close()
+    app.run(debug=True)
+
+# Endpoint para métricas de ventas
+from datetime import datetime, timedelta
+import json
+
+@app.route('/ventas-metricas', methods=['GET'])
+def ventas_metricas():
+    metrica = request.args.get('metrica', 'cantidad')
+    db = get_db()
+    fecha_limite = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
+    compras = db.execute('SELECT carrito, totalPagado, fecha FROM compras ').fetchall()
+    db.close()
+
+    # Procesar carritos y agrupar por producto
+    productos = {}
+    serie_diaria = {}
+    for row in compras:
+        fecha = row['fecha'][:10]  # Solo yyyy-mm-dd
+        try:
+            carrito = json.loads(row['carrito'].replace("'", '"'))
+        except Exception:
+            carrito = []
+        for item in carrito:
+            nombre = item.get('nombre', 'Desconocido')
+            cantidad = int(item.get('cantidad', 1))
+            ingreso = float(item.get('precio', 0)) * cantidad
+            if nombre not in productos:
+                productos[nombre] = {'cantidad': 0, 'ingreso': 0}
+            productos[nombre]['cantidad'] += cantidad
+            productos[nombre]['ingreso'] += ingreso
+            # Serie diaria por producto
+            if nombre not in serie_diaria:
+                serie_diaria[nombre] = {}
+            if fecha not in serie_diaria[nombre]:
+                serie_diaria[nombre][fecha] = {'cantidad': 0, 'ingreso': 0}
+            serie_diaria[nombre][fecha]['cantidad'] += cantidad
+            serie_diaria[nombre][fecha]['ingreso'] += ingreso
+
+    # Top 6 productos por metrica
+    top6 = sorted(productos.items(), key=lambda x: x[1][metrica], reverse=True)[:6]
+    # Top 5 productos para serie diaria
+    top5_nombres = [x[0] for x in sorted(productos.items(), key=lambda x: x[1][metrica], reverse=True)[:5]]
+    serie_top5 = {nombre: serie_diaria[nombre] for nombre in top5_nombres}
+
+    return jsonify({
+        'top6': [{
+            'nombre': nombre,
+            'cantidad': datos['cantidad'],
+            'ingreso': datos['ingreso']
+        } for nombre, datos in top6],
+        'serie_top5': serie_top5
+    })
+import os
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port)
+    port = int(os.environ.get("PORT", 5000))  # Render inyecta PORT
+    app.run(host="0.0.0.0", port=port, debug=True)
