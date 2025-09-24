@@ -12,6 +12,12 @@ def get_db():
     conn.row_factory = sqlite3.Row
     return conn
 
+
+@app.route("/")
+def home():
+    return jsonify({"mensaje": "Hola desde Flask en Render!"})
+
+
 @app.route('/compras', methods=['GET'])
 def listar_compras():
     db = get_db()
